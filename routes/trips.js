@@ -104,7 +104,8 @@ router.post("/", authenticateToken, async (req, res) => {
       is_public,
       status,
       budget,
-      cover_image
+      cover_image,
+      cover_image_path
     } = req.body;
 
     // Validate required fields
@@ -152,14 +153,15 @@ router.post("/", authenticateToken, async (req, res) => {
     const result = await db.query(
       `INSERT INTO trips (
         user_id, title, destination, country, latitude, longitude,
-        start_date, end_date, description, notes, tags, images, is_public
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        start_date, end_date, description, notes, tags, images, is_public,
+        cover_image, cover_image_path
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING *`,
       [
         userId,
         title.trim(),
         destination.trim(),
-        country,
+        finalCountry,
         finalLatitude,
         finalLongitude,
         start_date,
@@ -169,6 +171,8 @@ router.post("/", authenticateToken, async (req, res) => {
         tags || [],
         images || [],
         is_public || false,
+        cover_image || null,
+        cover_image_path || null
       ]
     );
 
@@ -207,6 +211,8 @@ router.put("/:id", authenticateToken, async (req, res) => {
       tags,
       images,
       is_public,
+      cover_image,
+      cover_image_path
     } = req.body;
 
     // Handle coordinates from frontend (coordinates object takes priority)
@@ -227,9 +233,11 @@ router.put("/:id", authenticateToken, async (req, res) => {
         tags = COALESCE($10, tags),
         images = COALESCE($11, images),
         is_public = COALESCE($12, is_public),
+        cover_image = COALESCE($13, cover_image),
+        cover_image_path = COALESCE($14, cover_image_path),
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $13 AND user_id = (
-        SELECT id FROM users WHERE firebase_uid = $14
+      WHERE id = $15 AND user_id = (
+        SELECT id FROM users WHERE firebase_uid = $16
       )
       RETURNING *`,
       [
@@ -245,6 +253,8 @@ router.put("/:id", authenticateToken, async (req, res) => {
         tags,
         images,
         is_public,
+        cover_image,
+        cover_image_path,
         req.params.id,
         req.user.uid,
       ]
