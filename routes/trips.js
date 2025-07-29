@@ -36,16 +36,27 @@ router.get("/", authenticateToken, async (req, res) => {
 
     const result = await db.query(query, params);
     
-    // Transform data to include coordinates object
-    const tripsWithCoordinates = result.rows.map(trip => ({
-      ...trip,
-      coordinates: trip.latitude && trip.longitude ? {
-        lat: parseFloat(trip.latitude),
-        lng: parseFloat(trip.longitude)
-      } : null
+    // Get gallery images for each trip
+    const tripsWithData = await Promise.all(result.rows.map(async (trip) => {
+      const galleryResult = await db.query(
+        `SELECT id, url, path, filename, original_name, order_index, uploaded_at 
+         FROM trip_gallery_images 
+         WHERE trip_id = $1 
+         ORDER BY order_index ASC, uploaded_at ASC`,
+        [trip.id]
+      );
+      
+      return {
+        ...trip,
+        coordinates: trip.latitude && trip.longitude ? {
+          lat: parseFloat(trip.latitude),
+          lng: parseFloat(trip.longitude)
+        } : null,
+        gallery_images: galleryResult.rows
+      };
     }));
     
-    res.json(tripsWithCoordinates);
+    res.json(tripsWithData);
   } catch (error) {
     console.error("Error fetching trips:", error);
     res.status(500).json({ error: "Failed to fetch trips" });
@@ -69,16 +80,25 @@ router.get("/:id", authenticateToken, async (req, res) => {
 
     const trip = result.rows[0];
     
-    // Add coordinates object
-    const tripWithCoordinates = {
+    // Get gallery images for this trip
+    const galleryResult = await db.query(
+      `SELECT id, url, path, filename, original_name, order_index, uploaded_at 
+       FROM trip_gallery_images 
+       WHERE trip_id = $1 
+       ORDER BY order_index ASC, uploaded_at ASC`,
+      [trip.id]
+    );
+    
+    const tripWithData = {
       ...trip,
       coordinates: trip.latitude && trip.longitude ? {
         lat: parseFloat(trip.latitude),
         lng: parseFloat(trip.longitude)
-      } : null
+      } : null,
+      gallery_images: galleryResult.rows
     };
 
-    res.json(tripWithCoordinates);
+    res.json(tripWithData);
   } catch (error) {
     console.error("Error fetching trip:", error);
     res.status(500).json({ error: "Failed to fetch trip" });
@@ -105,7 +125,8 @@ router.post("/", authenticateToken, async (req, res) => {
       status,
       budget,
       cover_image,
-      cover_image_path
+      cover_image_path,
+      gallery_images
     } = req.body;
 
     // Validate required fields
@@ -134,7 +155,6 @@ router.post("/", authenticateToken, async (req, res) => {
         }
       } catch (error) {
         console.error("Error extracting country:", error);
-        // Continue without country if geocoding fails
       }
     }
 
@@ -150,44 +170,79 @@ router.post("/", authenticateToken, async (req, res) => {
 
     const userId = userResult.rows[0].id;
 
-    const result = await db.query(
-      `INSERT INTO trips (
-        user_id, title, destination, country, latitude, longitude,
-        start_date, end_date, description, notes, tags, images, is_public,
-        cover_image, cover_image_path
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-      RETURNING *`,
-      [
-        userId,
-        title.trim(),
-        destination.trim(),
-        finalCountry,
-        finalLatitude,
-        finalLongitude,
-        start_date,
-        end_date,
-        description,
-        notes,
-        tags || [],
-        images || [],
-        is_public || false,
-        cover_image || null,
-        cover_image_path || null
-      ]
-    );
+    // Start transaction
+    await db.query('BEGIN');
 
-    const trip = result.rows[0];
-    
-    // Return trip with coordinates object
-    const tripWithCoordinates = {
-      ...trip,
-      coordinates: trip.latitude && trip.longitude ? {
-        lat: parseFloat(trip.latitude),
-        lng: parseFloat(trip.longitude)
-      } : null
-    };
+    try {
+      // Create trip
+      const result = await db.query(
+        `INSERT INTO trips (
+          user_id, title, destination, country, latitude, longitude,
+          start_date, end_date, description, notes, tags, images, is_public,
+          cover_image, cover_image_path
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING *`,
+        [
+          userId,
+          title.trim(),
+          destination.trim(),
+          finalCountry,
+          finalLatitude,
+          finalLongitude,
+          start_date,
+          end_date,
+          description,
+          notes,
+          tags || [],
+          images || [],
+          is_public || false,
+          cover_image || null,
+          cover_image_path || null
+        ]
+      );
 
-    res.status(201).json(tripWithCoordinates);
+      const trip = result.rows[0];
+      
+      // Add gallery images if provided
+      const galleryImagesData = [];
+      if (gallery_images && Array.isArray(gallery_images)) {
+        for (let i = 0; i < gallery_images.length; i++) {
+          const image = gallery_images[i];
+          const galleryResult = await db.query(
+            `INSERT INTO trip_gallery_images (
+              trip_id, url, path, filename, original_name, order_index
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *`,
+            [
+              trip.id,
+              image.url,
+              image.path,
+              image.filename,
+              image.original_name || image.filename,
+              image.order_index || i
+            ]
+          );
+          galleryImagesData.push(galleryResult.rows[0]);
+        }
+      }
+
+      await db.query('COMMIT');
+      
+      // Return trip with coordinates and gallery images
+      const tripWithData = {
+        ...trip,
+        coordinates: trip.latitude && trip.longitude ? {
+          lat: parseFloat(trip.latitude),
+          lng: parseFloat(trip.longitude)
+        } : null,
+        gallery_images: galleryImagesData
+      };
+
+      res.status(201).json(tripWithData);
+    } catch (error) {
+      await db.query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     console.error("Error creating trip:", error);
     res.status(500).json({ error: "Failed to create trip" });
@@ -212,73 +267,229 @@ router.put("/:id", authenticateToken, async (req, res) => {
       images,
       is_public,
       cover_image,
-      cover_image_path
+      cover_image_path,
+      gallery_images
     } = req.body;
 
     // Handle coordinates from frontend (coordinates object takes priority)
     const finalLatitude = coordinates?.lat || latitude;
     const finalLongitude = coordinates?.lng || longitude;
 
-    const result = await db.query(
-      `UPDATE trips SET
-        title = COALESCE($1, title),
-        destination = COALESCE($2, destination),
-        country = COALESCE($3, country),
-        latitude = COALESCE($4, latitude),
-        longitude = COALESCE($5, longitude),
-        start_date = COALESCE($6, start_date),
-        end_date = COALESCE($7, end_date),
-        description = COALESCE($8, description),
-        notes = COALESCE($9, notes),
-        tags = COALESCE($10, tags),
-        images = COALESCE($11, images),
-        is_public = COALESCE($12, is_public),
-        cover_image = COALESCE($13, cover_image),
-        cover_image_path = COALESCE($14, cover_image_path),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $15 AND user_id = (
-        SELECT id FROM users WHERE firebase_uid = $16
-      )
-      RETURNING *`,
-      [
-        title,
-        destination,
-        country,
-        finalLatitude,
-        finalLongitude,
-        start_date,
-        end_date,
-        description,
-        notes,
-        tags,
-        images,
-        is_public,
-        cover_image,
-        cover_image_path,
-        req.params.id,
-        req.user.uid,
-      ]
-    );
+    // Start transaction
+    await db.query('BEGIN');
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Trip not found or unauthorized" });
+    try {
+      // Update trip
+      const result = await db.query(
+        `UPDATE trips SET
+          title = COALESCE($1, title),
+          destination = COALESCE($2, destination),
+          country = COALESCE($3, country),
+          latitude = COALESCE($4, latitude),
+          longitude = COALESCE($5, longitude),
+          start_date = COALESCE($6, start_date),
+          end_date = COALESCE($7, end_date),
+          description = COALESCE($8, description),
+          notes = COALESCE($9, notes),
+          tags = COALESCE($10, tags),
+          images = COALESCE($11, images),
+          is_public = COALESCE($12, is_public),
+          cover_image = COALESCE($13, cover_image),
+          cover_image_path = COALESCE($14, cover_image_path),
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $15 AND user_id = (
+          SELECT id FROM users WHERE firebase_uid = $16
+        )
+        RETURNING *`,
+        [
+          title,
+          destination,
+          country,
+          finalLatitude,
+          finalLongitude,
+          start_date,
+          end_date,
+          description,
+          notes,
+          tags,
+          images,
+          is_public,
+          cover_image,
+          cover_image_path,
+          req.params.id,
+          req.user.uid,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        await db.query('ROLLBACK');
+        return res.status(404).json({ error: "Trip not found or unauthorized" });
+      }
+
+      const trip = result.rows[0];
+      
+      // Update gallery images if provided
+      let galleryImagesData = [];
+      if (gallery_images !== undefined) {
+        // Delete existing gallery images
+        await db.query(
+          "DELETE FROM trip_gallery_images WHERE trip_id = $1",
+          [trip.id]
+        );
+        
+        // Add new gallery images
+        if (Array.isArray(gallery_images)) {
+          for (let i = 0; i < gallery_images.length; i++) {
+            const image = gallery_images[i];
+            const galleryResult = await db.query(
+              `INSERT INTO trip_gallery_images (
+                trip_id, url, path, filename, original_name, order_index
+              ) VALUES ($1, $2, $3, $4, $5, $6)
+              RETURNING *`,
+              [
+                trip.id,
+                image.url,
+                image.path,
+                image.filename,
+                image.original_name || image.filename,
+                image.order_index || i
+              ]
+            );
+            galleryImagesData.push(galleryResult.rows[0]);
+          }
+        }
+      } else {
+        // If gallery_images not provided, fetch existing ones
+        const existingGallery = await db.query(
+          `SELECT id, url, path, filename, original_name, order_index, uploaded_at 
+           FROM trip_gallery_images 
+           WHERE trip_id = $1 
+           ORDER BY order_index ASC, uploaded_at ASC`,
+          [trip.id]
+        );
+        galleryImagesData = existingGallery.rows;
+      }
+
+      await db.query('COMMIT');
+      
+      // Return trip with coordinates and gallery images
+      const tripWithData = {
+        ...trip,
+        coordinates: trip.latitude && trip.longitude ? {
+          lat: parseFloat(trip.latitude),
+          lng: parseFloat(trip.longitude)
+        } : null,
+        gallery_images: galleryImagesData
+      };
+
+      res.json(tripWithData);
+    } catch (error) {
+      await db.query('ROLLBACK');
+      throw error;
     }
-
-    const trip = result.rows[0];
-    
-    // Return trip with coordinates object
-    const tripWithCoordinates = {
-      ...trip,
-      coordinates: trip.latitude && trip.longitude ? {
-        lat: parseFloat(trip.latitude),
-        lng: parseFloat(trip.longitude)
-      } : null
-    };
-
-    res.json(tripWithCoordinates);
   } catch (error) {
     console.error("Error updating trip:", error);
     res.status(500).json({ error: "Failed to update trip" });
+  }
+});
+
+// Add individual gallery image to trip
+router.post("/:id/gallery", authenticateToken, async (req, res) => {
+  try {
+    const { url, path, filename, original_name, order_index } = req.body;
+    
+    if (!url || !path || !filename) {
+      return res.status(400).json({ error: "URL, path, and filename are required" });
+    }
+
+    // Verify trip ownership
+    const tripCheck = await db.query(
+      `SELECT t.id FROM trips t 
+       JOIN users u ON t.user_id = u.id 
+       WHERE t.id = $1 AND u.firebase_uid = $2`,
+      [req.params.id, req.user.uid]
+    );
+
+    if (tripCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Trip not found or unauthorized" });
+    }
+
+    const result = await db.query(
+      `INSERT INTO trip_gallery_images (
+        trip_id, url, path, filename, original_name, order_index
+      ) VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *`,
+      [
+        req.params.id,
+        url,
+        path,
+        filename,
+        original_name || filename,
+        order_index || 0
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error adding gallery image:", error);
+    res.status(500).json({ error: "Failed to add gallery image" });
+  }
+});
+
+// Delete gallery image
+router.delete("/:id/gallery/:imageId", authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `DELETE FROM trip_gallery_images 
+       WHERE id = $1 AND trip_id = $2 AND trip_id IN (
+         SELECT t.id FROM trips t 
+         JOIN users u ON t.user_id = u.id 
+         WHERE u.firebase_uid = $3
+       )
+       RETURNING id`,
+      [req.params.imageId, req.params.id, req.user.uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Gallery image not found or unauthorized" });
+    }
+
+    res.json({ message: "Gallery image deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting gallery image:", error);
+    res.status(500).json({ error: "Failed to delete gallery image" });
+  }
+});
+
+// Update gallery image order
+router.put("/:id/gallery/:imageId/order", authenticateToken, async (req, res) => {
+  try {
+    const { order_index } = req.body;
+    
+    if (order_index === undefined) {
+      return res.status(400).json({ error: "Order index is required" });
+    }
+
+    const result = await db.query(
+      `UPDATE trip_gallery_images 
+       SET order_index = $1 
+       WHERE id = $2 AND trip_id = $3 AND trip_id IN (
+         SELECT t.id FROM trips t 
+         JOIN users u ON t.user_id = u.id 
+         WHERE u.firebase_uid = $4
+       )
+       RETURNING *`,
+      [order_index, req.params.imageId, req.params.id, req.user.uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Gallery image not found or unauthorized" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating gallery image order:", error);
+    res.status(500).json({ error: "Failed to update gallery image order" });
   }
 });
 
